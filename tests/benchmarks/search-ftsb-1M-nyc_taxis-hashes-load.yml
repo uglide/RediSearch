@@ -1,7 +1,7 @@
 name: "ftsb-1M-nyc_taxis-hashes-load"
 description: "
-             nyc_taxis [details here](https://github.com/RediSearch/ftsb/blob/master/docs/nyc_taxis-benchmark/description.md), 
-             benchmark focused on write performance, making usage of TLC Trip Record Data that contains the rides that have been performed in yellow taxis in New York in 2015. 
+             nyc_taxis [details here](https://github.com/RediSearch/ftsb/blob/master/docs/nyc_taxis-benchmark/description.md),
+             benchmark focused on write performance, making usage of TLC Trip Record Data that contains the rides that have been performed in yellow taxis in New York in 2015.
              On average each added document will have a size of 500 bytes.
              Ingestion Type (FT.ADD|HSET): HSET
              The use case generates an secondary index with 18 fields per document:
