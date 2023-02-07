@@ -15,7 +15,7 @@ setups:
 dbconfig:
   - module-configuration-parameters:
       redisearch:
-        WORKER_THREADS: 8
+        WORKER_THREADS: 1
         ENABLE_THREADS: 'TRUE'
   tool: ann-benchmarks
   dataset_name: "hnsw__mnist-784-euclidean_M-4"

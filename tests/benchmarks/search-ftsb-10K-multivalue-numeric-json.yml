@@ -10,7 +10,7 @@ setups:
 dbconfig:
   - module-configuration-parameters:
       redisearch:
-        WORKER_THREADS: 8
+        WORKER_THREADS: 1
         ENABLE_THREADS: 'TRUE'
   - dataset_name: "ftsb-10K-multivalue-numeric-json"
   - init_commands:
