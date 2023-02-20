@@ -78,22 +78,27 @@ static void setMemoryInfo(RedisModuleCtx *ctx) {
   RedisModule_FreeServerInfo(ctx, info);
 }
 
-/*
- * Get a field spec by field name. Case sensetive!
- * Return the field spec if found, NULL if not.
- * Assuming the spec is properly locked before calling this function.
- */
-const FieldSpec *IndexSpec_GetField(const IndexSpec *spec, const char *name, size_t len) {
-  for (size_t i = 0; i < spec->numFields; i++) {
-    if (len != strlen(spec->fields[i].name)) {
+static const FieldSpec *IndexSchema_GetField(const IndexSchema *scema, const char *name, size_t len) {
+  for (size_t i = 0; i < scema->numFields; i++) {
+    if (len != strlen(scema->fields[i].name)) {
       continue;
     }
-    const FieldSpec *fs = spec->fields + i;
+    const FieldSpec *fs = scema->fields + i;
     if (!strncmp(fs->name, name, len)) {
       return fs;
     }
   }
   return NULL;
+}
+
+/*
+ * Get a field spec by field name. Case sensetive!
+ * Return the field spec if found, NULL if not.
+ * Assuming the spec is properly locked before calling this function.
+ * TODO: multithreaded: verify that the spec is locked
+ */
+const FieldSpec *IndexSpec_GetField(const IndexSpec *spec, const char *name, size_t len) {
+  return IndexSchema_GetField(spec->schema, name, len);
 }
 
 // Assuming the spec is properly locked before calling this function.
@@ -115,9 +120,10 @@ int IndexSpec_CheckPhoneticEnabled(const IndexSpec *sp, t_fieldMask fm) {
     return 1;
   }
 
-  for (size_t ii = 0; ii < sp->numFields; ++ii) {
+  const IndexSchema *sch = sp->schema;
+  for (size_t ii = 0; ii < sch->numFields; ++ii) {
     if (fm & ((t_fieldMask)1 << ii)) {
-      const FieldSpec *fs = sp->fields + ii;
+      const FieldSpec *fs = sch->fields + ii;
       if (FIELD_IS(fs, INDEXFLD_T_FULLTEXT) && (FieldSpec_IsPhonetics(fs))) {
         return 1;
       }
@@ -128,9 +134,10 @@ int IndexSpec_CheckPhoneticEnabled(const IndexSpec *sp, t_fieldMask fm) {
 
 // Assuming the spec is properly locked before calling this function.
 int IndexSpec_CheckAllowSlopAndInorder(const IndexSpec *spec, t_fieldMask fm, QueryError *status) {
-  for (size_t ii = 0; ii < spec->numFields; ++ii) {
+  const IndexSchema *sch = spec->schema;
+  for (size_t ii = 0; ii < sch->numFields; ++ii) {
     if (fm & ((t_fieldMask)1 << ii)) {
-      const FieldSpec *fs = spec->fields + ii;
+      const FieldSpec *fs = sch->fields + ii;
       if (FIELD_IS(fs, INDEXFLD_T_FULLTEXT) && (FieldSpec_IsUndefinedOrder(fs))) {
         QueryError_SetErrorFmt(status, QUERY_EBADORDEROPTION,
           "slop/inorder are not supported for field `%s` since it has undefined ordering", fs->name);
@@ -143,9 +150,10 @@ int IndexSpec_CheckAllowSlopAndInorder(const IndexSpec *spec, t_fieldMask fm, Qu
 
 // Assuming the spec is properly locked before calling this function.
 const FieldSpec *IndexSpec_GetFieldBySortingIndex(const IndexSpec *sp, uint16_t idx) {
-  for (size_t ii = 0; ii < sp->numFields; ++ii) {
-    if (sp->fields[ii].options & FieldSpec_Sortable && sp->fields[ii].sortIdx == idx) {
-      return sp->fields + ii;
+  const IndexSchema *sch = sp->schema;
+  for (size_t ii = 0; ii < sch->numFields; ++ii) {
+    if (sch->fields[ii].options & FieldSpec_Sortable && sch->fields[ii].sortIdx == idx) {
+      return sch->fields + ii;
     }
   }
   return NULL;
@@ -153,10 +161,11 @@ const FieldSpec *IndexSpec_GetFieldBySortingIndex(const IndexSpec *sp, uint16_t 
 
 // Assuming the spec is properly locked before calling this function.
 const char *IndexSpec_GetFieldNameByBit(const IndexSpec *sp, t_fieldMask id) {
-  for (int i = 0; i < sp->numFields; i++) {
-    if (FIELD_BIT(&sp->fields[i]) == id && FIELD_IS(&sp->fields[i], INDEXFLD_T_FULLTEXT) &&
-        FieldSpec_IsIndexable(&sp->fields[i])) {
-      return sp->fields[i].name;
+  const IndexSchema *sch = sp->schema;
+  for (int i = 0; i < sch->numFields; i++) {
+    if (FIELD_BIT(&sch->fields[i]) == id && FIELD_IS(&sch->fields[i], INDEXFLD_T_FULLTEXT) &&
+        FieldSpec_IsIndexable(&sch->fields[i])) {
+      return sch->fields[i].name;
     }
   }
   return NULL;
@@ -186,9 +195,10 @@ StrongRef IndexSpec_ParseRedisArgs(RedisModuleCtx *ctx, RedisModuleString *name,
 FieldSpec **getFieldsByType(IndexSpec *spec, FieldType type) {
 #define FIELDS_ARRAY_CAP 2
   FieldSpec **fields = array_new(FieldSpec *, FIELDS_ARRAY_CAP);
-  for (int i = 0; i < spec->numFields; ++i) {
-    if (FIELD_IS(spec->fields + i, type)) {
-      fields = array_append(fields, &(spec->fields[i]));
+  const IndexSchema *sch = spec->schema;
+  for (int i = 0; i < sch->numFields; ++i) {
+    if (FIELD_IS(sch->fields + i, type)) {
+      fields = array_append(fields, &(sch->fields[i]));
     }
   }
   return fields;
@@ -851,10 +861,10 @@ error:
 }
 
 // Assuming the spec is properly locked before calling this function.
-int IndexSpec_CreateTextId(const IndexSpec *sp) {
+int IndexSchema_CreateTextId(const IndexSchema *sc) {
   int maxId = -1;
-  for (size_t ii = 0; ii < sp->numFields; ++ii) {
-    const FieldSpec *fs = sp->fields + ii;
+  for (size_t ii = 0; ii < sc->numFields; ++ii) {
+    const FieldSpec *fs = sc->fields + ii;
     if (FIELD_IS(fs, INDEXFLD_T_FULLTEXT)) {
       if (fs->ftId == (t_fieldId)-1) {
         // ignore
@@ -870,7 +880,8 @@ int IndexSpec_CreateTextId(const IndexSpec *sp) {
   return maxId + 1;
 }
 
-static IndexSpecCache *IndexSpec_BuildSpecCache(const IndexSpec *spec);
+static IndexSchema *IndexSchema_Clone(const IndexSchema *s);
+static void IndexSchema_Free(IndexSchema *s);
 
 /**
  * Add fields to an existing (or newly created) index. If the addition fails,
@@ -881,12 +892,13 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
     QueryError_SetErrorFmt(status, QUERY_EPARSEARGS, "Fields arguments are missing");
     return 0;
   }
-  const size_t prevNumFields = sp->numFields;
+  const IndexFlags prevFlags = sp->flags;
   const size_t prevSortLen = sp->sortables->len;
-  FieldSpec *fs = NULL;
+
+  IndexSchema *new_schema = IndexSchema_Clone(sp->schema);
 
   while (!AC_IsAtEnd(ac)) {
-    if (sp->numFields == SPEC_MAX_FIELDS) {
+    if (new_schema->numFields == SPEC_MAX_FIELDS) {
       QueryError_SetErrorFmt(status, QUERY_ELIMIT, "Schema is limited to %d fields",
                              SPEC_MAX_FIELDS);
       goto reset;
@@ -909,18 +921,18 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
       fieldPath = NULL;
     }
 
-    if (IndexSpec_GetField(sp, fieldName, namelen)) {
+    if (IndexSchema_GetField(new_schema, fieldName, namelen)) {
       QueryError_SetErrorFmt(status, QUERY_EINVAL, "Duplicate field in schema - %s", fieldName);
       goto reset;
     }
 
-    fs = IndexSpec_CreateField(sp, fieldName, fieldPath);
+    FieldSpec *fs = IndexSpec_CreateField(sp, new_schema, fieldName, fieldPath);
     if (!parseFieldSpec(ac, sp, fs, status)) {
       goto reset;
     }
 
     if (FIELD_IS(fs, INDEXFLD_T_FULLTEXT) && FieldSpec_IsIndexable(fs)) {
-      int textId = IndexSpec_CreateTextId(sp);
+      int textId = IndexSchema_CreateTextId(new_schema);
       if (textId < 0) {
         QueryError_SetErrorFmt(status, QUERY_ELIMIT, "Schema is limited to %d TEXT fields",
                                SPEC_MAX_FIELD_ID);
@@ -999,29 +1011,22 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
         sp->suffix = NewTrie(suffixTrie_freeCallback, Trie_Sort_Lex);
       }
     }
-    fs = NULL;
   }
 
-  // If we successfully modified the schema, we need to update the spec cache
-  IndexSpecCache_Decref(sp->spcache);
-  sp->spcache = IndexSpec_BuildSpecCache(sp);
+  // If we successfully modified the schema, we need to update the spec schema
+  IndexSchema_Release(sp->schema);
+  sp->schema = new_schema;
 
   return 1;
 
 reset:
-  // If the current field spec exists, but was not added (i.e. we got an error)
-  // and reached this block, then free it
-  if (fs) {
-    // if we have a field spec it means that we increased the number of fields, so we need to
-    // decreas it.
-    --sp->numFields;
-    FieldSpec_Cleanup(fs);
+  for (size_t ii = sp->schema ? sp->schema->numFields : 0; ii < new_schema->numFields; ++ii) {
+    FieldSpec_Cleanup(new_schema->fields + ii);
   }
-  for (size_t ii = prevNumFields; ii < sp->numFields; ++ii) {
-    FieldSpec_Cleanup(&sp->fields[ii]);
-  }
+  IndexSchema_Free(new_schema);
 
-  sp->numFields = prevNumFields;
+  // If we didn't have a suffix trie before, but we added one, add the flag
+  sp->flags = prevFlags & (sp->flags & Index_HasSuffixTrie);
   sp->sortables->len = prevSortLen;
   return 0;
 }
@@ -1130,8 +1135,8 @@ StrongRef IndexSpec_Parse(const char *name, const char **argv, int argc, QueryEr
     SchemaRule_FilterFields(spec);
   }
 
-  for (int i = 0; i < spec->numFields; i++) {
-    FieldsGlobalStats_UpdateStats(spec->fields + i, 1);
+  for (int i = 0; i < spec->schema->numFields; i++) {
+    FieldsGlobalStats_UpdateStats(spec->schema->fields + i, 1);
   }
 
   return spec_ref;
@@ -1166,50 +1171,52 @@ void Spec_AddToDict(RefManager *rm) {
   dictAdd(specDict_g, ((IndexSpec*)__RefManager_Get_Object(rm))->name, (void *)rm);
 }
 
-static void IndexSpecCache_Free(IndexSpecCache *c) {
-  for (size_t ii = 0; ii < c->nfields; ++ii) {
-    if (c->fields[ii].name != c->fields[ii].path) {
-      rm_free(c->fields[ii].name);
+static void IndexSchema_Free(IndexSchema *s) {
+  for (size_t ii = 0; ii < s->numFields; ++ii) {
+    if (s->fields[ii].name != s->fields[ii].path) {
+      rm_free(s->fields[ii].name);
     }
-    rm_free(c->fields[ii].path);
+    rm_free(s->fields[ii].path);
   }
-  rm_free(c->fields);
-  rm_free(c);
+  rm_free(s->fields);
+  rm_free(s);
 }
 
 // The value of the refcount can get to 0 only if the index spec itself does not point to it anymore,
 // and at this point the refcount only gets decremented so there is no wory of some thread increasing the
 // refcount while we are freeing the cache.
-void IndexSpecCache_Decref(IndexSpecCache *c) {
-  if (c && !__atomic_sub_fetch(&c->refcount, 1, __ATOMIC_RELAXED)) {
-    IndexSpecCache_Free(c);
+void IndexSchema_Release(const IndexSchema *cs) {
+  IndexSchema *s = (IndexSchema *)cs;
+  if (s && !__atomic_sub_fetch(&s->refcount, 1, __ATOMIC_RELAXED)) {
+    IndexSchema_Free(s);
   }
 }
 
 // Assuming the spec is properly locked before calling this function.
-static IndexSpecCache *IndexSpec_BuildSpecCache(const IndexSpec *spec) {
-  IndexSpecCache *ret = rm_calloc(1, sizeof(*ret));
-  ret->nfields = spec->numFields;
-  ret->fields = rm_malloc(sizeof(*ret->fields) * ret->nfields);
+static IndexSchema *IndexSchema_Clone(const IndexSchema *s) {
+  IndexSchema *ret = rm_calloc(1, sizeof(*ret));
   ret->refcount = 1;
-  for (size_t ii = 0; ii < spec->numFields; ++ii) {
-    ret->fields[ii] = spec->fields[ii];
-    ret->fields[ii].name = rm_strdup(spec->fields[ii].name);
-    // if name & path are pointing to the same string, copy pointer
-    if (ret->fields[ii].path && (spec->fields[ii].name != spec->fields[ii].path)) {
-      ret->fields[ii].path = rm_strdup(spec->fields[ii].path);
-    } else {
-      // use the same pointer for both name and path
-      ret->fields[ii].path = ret->fields[ii].name;
+  if (s) {
+    ret->numFields = s->numFields;
+    ret->fields = rm_malloc(sizeof(*ret->fields) * ret->numFields);
+    for (size_t ii = 0; ii < s->numFields; ++ii) {
+      ret->fields[ii] = s->fields[ii];
+      ret->fields[ii].name = rm_strdup(s->fields[ii].name);
+      // if name & path are pointing to the same string, copy pointer
+      if (ret->fields[ii].path && (s->fields[ii].name != s->fields[ii].path)) {
+        ret->fields[ii].path = rm_strdup(s->fields[ii].path);
+      } else {
+        // use the same pointer for both name and path
+        ret->fields[ii].path = ret->fields[ii].name;
+      }
     }
   }
   return ret;
 }
 
-IndexSpecCache *IndexSpec_GetSpecCache(const IndexSpec *spec) {
-  RS_LOG_ASSERT(spec->spcache, "Index spec cache is NULL");
-  __atomic_fetch_add(&spec->spcache->refcount, 1, __ATOMIC_RELAXED);
-  return spec->spcache;
+const IndexSchema *IndexSpec_GetSchema(const IndexSpec *spec) {
+  __atomic_fetch_add(&((IndexSchema *)spec->schema)->refcount, 1, __ATOMIC_RELAXED);
+  return spec->schema;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -1255,12 +1262,10 @@ static void IndexSpec_FreeUnlinkedData(IndexSpec *spec) {
     SchemaRule_Free(spec->rule);
     spec->rule = NULL;
   }
-  // Free fields cache data
-  IndexSpecCache_Decref(spec->spcache);
-
   // Free fields formatted names
   if (spec->indexStrs) {
-    for (size_t ii = 0; ii < spec->numFields; ++ii) {
+    size_t numFields = spec->schema ? spec->schema->numFields : 0;
+    for (size_t ii = 0; ii < numFields; ++ii) {
       IndexSpecFmtStrings *fmts = spec->indexStrs + ii;
       for (size_t jj = 0; jj < INDEXFLD_NUM_TYPES; ++jj) {
         if (fmts->types[jj]) {
@@ -1271,15 +1276,7 @@ static void IndexSpec_FreeUnlinkedData(IndexSpec *spec) {
     rm_free(spec->indexStrs);
   }
   // Free fields data
-  if (spec->fields != NULL) {
-    for (size_t i = 0; i < spec->numFields; i++) {
-      if (spec->fields[i].name != spec->fields[i].path) {
-        rm_free(spec->fields[i].name);
-      }
-      rm_free(spec->fields[i].path);
-    }
-    rm_free(spec->fields);
-  }
+  IndexSchema_Release(spec->schema);
   // Free spec name
   rm_free(spec->name);
   // Free sortable list
@@ -1334,9 +1331,9 @@ void IndexSpec_Free(IndexSpec *spec) {
     spec->stopwords = NULL;
   }
   // Reset fields stats
-  if (spec->fields != NULL) {
-    for (size_t i = 0; i < spec->numFields; i++) {
-      FieldsGlobalStats_UpdateStats(spec->fields + i, -1);
+  if (spec->schema) {
+    for (size_t i = 0; i < spec->schema->numFields; i++) {
+      FieldsGlobalStats_UpdateStats(spec->schema->fields + i, -1);
     }
   }
   // Free unlinked index spec on a second thread
@@ -1511,7 +1508,6 @@ void IndexSpec_InitializeSynonym(IndexSpec *sp) {
 
 IndexSpec *NewIndexSpec(const char *name) {
   IndexSpec *sp = rm_calloc(1, sizeof(IndexSpec));
-  sp->fields = rm_calloc(sizeof(FieldSpec), SPEC_MAX_FIELDS);
   sp->sortables = NewSortingTable();
   sp->flags = INDEX_DEFAULT_FLAGS;
   sp->name = rm_strdup(name);
@@ -1550,11 +1546,11 @@ IndexSpec *NewIndexSpec(const char *name) {
 }
 
 // Assuming the spec is properly locked before calling this function.
-FieldSpec *IndexSpec_CreateField(IndexSpec *sp, const char *name, const char *path) {
-  sp->fields = rm_realloc(sp->fields, sizeof(*sp->fields) * (sp->numFields + 1));
-  FieldSpec *fs = sp->fields + sp->numFields;
+FieldSpec *IndexSpec_CreateField(IndexSpec *sp, IndexSchema *schema, const char *name, const char *path) {
+  schema->fields = rm_realloc(schema->fields, sizeof(*schema->fields) * (schema->numFields + 1));
+  FieldSpec *fs = schema->fields + schema->numFields;
   memset(fs, 0, sizeof(*fs));
-  fs->index = sp->numFields++;
+  fs->index = schema->numFields++;
   fs->name = rm_strdup(name);
   fs->path = (path) ? rm_strdup(path) : fs->name;
   fs->ftId = (t_fieldId)-1;
@@ -2138,8 +2134,9 @@ void IndexSpec_DropLegacyIndexFromKeySpace(IndexSpec *sp) {
   TrieIterator_Free(it);
 
   // Delete the numeric, tag, and geo indexes which reside on separate keys
-  for (size_t i = 0; i < ctx.spec->numFields; i++) {
-    const FieldSpec *fs = ctx.spec->fields + i;
+  const IndexSchema *schema = ctx.spec->schema;
+  for (size_t i = 0; i < schema->numFields; i++) {
+    const FieldSpec *fs = schema->fields + i;
     if (FIELD_IS(fs, INDEXFLD_T_NUMERIC)) {
       Redis_DeleteKey(ctx.redisCtx, IndexSpec_GetFormattedKey(ctx.spec, fs, INDEXFLD_T_NUMERIC));
     }
@@ -2210,16 +2207,18 @@ int IndexSpec_CreateFromRdb(RedisModuleCtx *ctx, RedisModuleIO *rdb, int encver,
     sp->flags |= Index_StoreFreqs;
   }
 
-  sp->numFields = LoadUnsigned_IOError(rdb, goto cleanup);
-  sp->fields = rm_calloc(sp->numFields, sizeof(FieldSpec));
+  IndexSchema *schema = IndexSchema_Clone(NULL); // create a new schema
+  sp->schema = schema;
+  schema->numFields = LoadUnsigned_IOError(rdb, goto cleanup);
+  schema->fields = rm_calloc(schema->numFields, sizeof(FieldSpec));
   int maxSortIdx = -1;
-  for (int i = 0; i < sp->numFields; i++) {
-    FieldSpec *fs = sp->fields + i;
-    if (FieldSpec_RdbLoad(rdb, sp->fields + i, encver) != REDISMODULE_OK) {
+  for (int i = 0; i < schema->numFields; i++) {
+    FieldSpec *fs = schema->fields + i;
+    if (FieldSpec_RdbLoad(rdb, schema->fields + i, encver) != REDISMODULE_OK) {
       QueryError_SetErrorFmt(status, QUERY_EPARSEARGS, "Failed to load index field");
       goto cleanup;
     }
-    sp->fields[i].index = i;
+    schema->fields[i].index = i;
     if (FieldSpec_IsSortable(fs)) {
       RSSortingTable_Add(&sp->sortables, fs->name, fieldTypeToValueType(fs->types));
     }
@@ -2231,8 +2230,6 @@ int IndexSpec_CreateFromRdb(RedisModuleCtx *ctx, RedisModuleIO *rdb, int encver,
       }
     }
   }
-  // After loading all the fields, we can build the spec cache
-  sp->spcache = IndexSpec_BuildSpecCache(sp);
 
   //    IndexStats_RdbLoad(rdb, &sp->stats);
 
@@ -2301,8 +2298,8 @@ int IndexSpec_CreateFromRdb(RedisModuleCtx *ctx, RedisModuleIO *rdb, int encver,
     dictAdd(specDict_g, sp->name, spec_ref.rm);
   }
 
-  for (int i = 0; i < sp->numFields; i++) {
-    FieldsGlobalStats_UpdateStats(sp->fields + i, 1);
+  for (int i = 0; i < schema->numFields; i++) {
+    FieldsGlobalStats_UpdateStats(schema->fields + i, 1);
   }
 
   return REDISMODULE_OK;
@@ -2334,19 +2331,19 @@ void *IndexSpec_LegacyRdbLoad(RedisModuleIO *rdb, int encver) {
     sp->flags |= Index_StoreFreqs;
   }
 
-  sp->numFields = RedisModule_LoadUnsigned(rdb);
-  sp->fields = rm_calloc(sp->numFields, sizeof(FieldSpec));
+  IndexSchema *schema = IndexSchema_Clone(NULL); // create a new schema
+  sp->schema = schema;
+  schema->numFields = RedisModule_LoadUnsigned(rdb);
+  schema->fields = rm_calloc(schema->numFields, sizeof(FieldSpec));
   int maxSortIdx = -1;
-  for (int i = 0; i < sp->numFields; i++) {
-    FieldSpec *fs = sp->fields + i;
-    FieldSpec_RdbLoad(rdb, sp->fields + i, encver);
-    sp->fields[i].index = i;
+  for (int i = 0; i < schema->numFields; i++) {
+    FieldSpec *fs = schema->fields + i;
+    FieldSpec_RdbLoad(rdb, schema->fields + i, encver);
+    schema->fields[i].index = i;
     if (FieldSpec_IsSortable(fs)) {
       RSSortingTable_Add(&sp->sortables, fs->name, fieldTypeToValueType(fs->types));
     }
   }
-  // After loading all the fields, we can build the spec cache
-  sp->spcache = IndexSpec_BuildSpecCache(sp);
 
   IndexStats_RdbLoad(rdb, &sp->stats);
 
@@ -2457,9 +2454,9 @@ void Indexes_RdbSave(RedisModuleIO *rdb, int when) {
     // we save the name plus the null terminator
     RedisModule_SaveStringBuffer(rdb, sp->name, sp->nameLen + 1);
     RedisModule_SaveUnsigned(rdb, (uint64_t)sp->flags);
-    RedisModule_SaveUnsigned(rdb, sp->numFields);
-    for (int i = 0; i < sp->numFields; i++) {
-      FieldSpec_RdbSave(rdb, &sp->fields[i]);
+    RedisModule_SaveUnsigned(rdb, sp->schema->numFields);
+    for (int i = 0; i < sp->schema->numFields; i++) {
+      FieldSpec_RdbSave(rdb, &sp->schema->fields[i]);
     }
 
     SchemaRule_RdbSave(sp->rule, rdb);
@@ -2649,9 +2646,10 @@ void IndexSpec_DeleteDoc_Unsafe(IndexSpec *spec, RedisModuleCtx *ctx, RedisModul
 
   // VecSim fields clear deleted data on the fly
   if (spec->flags & Index_HasVecSim) {
-    for (int i = 0; i < spec->numFields; ++i) {
-      if (spec->fields[i].types == INDEXFLD_T_VECTOR) {
-        RedisModuleString *rmskey = RedisModule_CreateString(ctx, spec->fields[i].name, strlen(spec->fields[i].name));
+    const IndexSchema *schema = spec->schema;
+    for (int i = 0; i < schema->numFields; ++i) {
+      if (schema->fields[i].types == INDEXFLD_T_VECTOR) {
+        RedisModuleString *rmskey = RedisModule_CreateString(ctx, schema->fields[i].name, strlen(schema->fields[i].name));
         KeysDictValue *kdv = dictFetchValue(spec->keysDict, rmskey);
         RedisModule_FreeString(ctx, rmskey);
 
@@ -2790,10 +2788,11 @@ static bool hashFieldChanged(IndexSpec *spec, RedisModuleString **hashFields) {
   }
 
   // TODO: improve implementation to avoid O(n^2)
+  const IndexSchema *schema = spec->schema;
   for (size_t i = 0; hashFields[i] != NULL; ++i) {
     const char *field = RedisModule_StringPtrLen(hashFields[i], NULL);
-    for (size_t j = 0; j < spec->numFields; ++j) {
-      if (!strcmp(field, spec->fields[j].name)) {
+    for (size_t j = 0; j < schema->numFields; ++j) {
+      if (!strcmp(field, schema->fields[j].name)) {
         return true;
       }
     }
