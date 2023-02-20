@@ -870,6 +870,8 @@ int IndexSpec_CreateTextId(const IndexSpec *sp) {
   return maxId + 1;
 }
 
+static IndexSpecCache *IndexSpec_BuildSpecCache(const IndexSpec *spec);
+
 /**
  * Add fields to an existing (or newly created) index. If the addition fails,
  */
@@ -878,13 +880,6 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
   if (ac->offset == ac->argc) {
     QueryError_SetErrorFmt(status, QUERY_EPARSEARGS, "Fields arguments are missing");
     return 0;
-  }
-
-  if (sp->spcache) {
-    // Assuming we locked the index spec for write and we have a single writer,
-    // we don't need atomic operations here.
-    IndexSpecCache_Decref(sp->spcache);
-    sp->spcache = NULL;
   }
   const size_t prevNumFields = sp->numFields;
   const size_t prevSortLen = sp->sortables->len;
@@ -1006,6 +1001,11 @@ static int IndexSpec_AddFieldsInternal(IndexSpec *sp, ArgsCursor *ac, QueryError
     }
     fs = NULL;
   }
+
+  // If we successfully modified the schema, we need to update the spec cache
+  IndexSpecCache_Decref(sp->spcache);
+  sp->spcache = IndexSpec_BuildSpecCache(sp);
+
   return 1;
 
 reset:
@@ -1181,11 +1181,12 @@ static void IndexSpecCache_Free(IndexSpecCache *c) {
 // and at this point the refcount only gets decremented so there is no wory of some thread increasing the
 // refcount while we are freeing the cache.
 void IndexSpecCache_Decref(IndexSpecCache *c) {
-  if (!__atomic_sub_fetch(&c->refcount, 1, __ATOMIC_RELAXED)) {
+  if (c && !__atomic_sub_fetch(&c->refcount, 1, __ATOMIC_RELAXED)) {
     IndexSpecCache_Free(c);
   }
 }
 
+// Assuming the spec is properly locked before calling this function.
 static IndexSpecCache *IndexSpec_BuildSpecCache(const IndexSpec *spec) {
   IndexSpecCache *ret = rm_calloc(1, sizeof(*ret));
   ret->nfields = spec->numFields;
@@ -1205,14 +1206,8 @@ static IndexSpecCache *IndexSpec_BuildSpecCache(const IndexSpec *spec) {
   return ret;
 }
 
-// This function is only being called from the main-thread (at the moment) under the GIL and the spec's
-// read lock, so there is no race on setting the cache value if it is null.
-// The refcount still should be atomic as it is being accessed from other threads (for decref).
 IndexSpecCache *IndexSpec_GetSpecCache(const IndexSpec *spec) {
-  if (!spec->spcache) {
-    ((IndexSpec *)spec)->spcache = IndexSpec_BuildSpecCache(spec);
-  }
-
+  RS_LOG_ASSERT(spec->spcache, "Index spec cache is NULL");
   __atomic_fetch_add(&spec->spcache->refcount, 1, __ATOMIC_RELAXED);
   return spec->spcache;
 }
@@ -1261,12 +1256,8 @@ static void IndexSpec_FreeUnlinkedData(IndexSpec *spec) {
     spec->rule = NULL;
   }
   // Free fields cache data
-  if (spec->spcache) {
-    // Assuming we locked the index spec for write and we have a single writer,
-    // we don't need atomic operations here.
-    IndexSpecCache_Decref(spec->spcache);
-    spec->spcache = NULL;
-  }
+  IndexSpecCache_Decref(spec->spcache);
+
   // Free fields formatted names
   if (spec->indexStrs) {
     for (size_t ii = 0; ii < spec->numFields; ++ii) {
@@ -2239,8 +2230,9 @@ int IndexSpec_CreateFromRdb(RedisModuleCtx *ctx, RedisModuleIO *rdb, int encver,
         sp->suffix = NewTrie(suffixTrie_freeCallback, Trie_Sort_Lex);
       }
     }
-
   }
+  // After loading all the fields, we can build the spec cache
+  sp->spcache = IndexSpec_BuildSpecCache(sp);
 
   //    IndexStats_RdbLoad(rdb, &sp->stats);
 
@@ -2353,6 +2345,8 @@ void *IndexSpec_LegacyRdbLoad(RedisModuleIO *rdb, int encver) {
       RSSortingTable_Add(&sp->sortables, fs->name, fieldTypeToValueType(fs->types));
     }
   }
+  // After loading all the fields, we can build the spec cache
+  sp->spcache = IndexSpec_BuildSpecCache(sp);
 
   IndexStats_RdbLoad(rdb, &sp->stats);
 
